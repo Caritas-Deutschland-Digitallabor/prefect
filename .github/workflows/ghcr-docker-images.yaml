@@ -1,0 +1,236 @@
+name: GHCR Docker images
+
+on:
+  release:
+    types: [released, prereleased]
+  workflow_dispatch:
+    inputs:
+      publish_3_latest:
+        description: "Publish 3-latest images"
+        required: false
+        type: boolean
+        default: false
+      tag:
+        description: "Build dev images for a specific tag (e.g., 3.6.6.dev5)"
+        required: false
+        type: string
+      prefect_version:
+        description: "Prefect version to use for prefect-aws images"
+        required: false
+        type: string
+      prefect_aws_version:
+        description: "Prefect AWS version to use for prefect-aws images"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-ghcr-images:
+    name: Build and publish to GHCR
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'release' && github.event.release.prerelease && 'pre-release' || github.event_name == 'release' && 'prod' || 'dev' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - "prefect"
+          - "prefect-client"
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+        flavor:
+        - ""
+        - "-conda"
+        - "-kubernetes"
+        exclude:
+        - image: "prefect-client"
+          flavor: "-conda"
+        - image: "prefect-client"
+          flavor: "-kubernetes"
+
+    steps:
+      - name: Validate prerelease tag
+        if: ${{ github.event_name == 'release' && github.event.release.prerelease == true }}
+        run: |
+          TAG_NAME=${{ github.ref }}
+          if [[ ! "$TAG_NAME" =~ ^refs/tags/[0-9]+\.[0-9]+\.[0-9]+([a-zA-Z0-9]+|\.dev[0-9]+)$ ]]; then
+            echo "Error: Tag $TAG_NAME does not match prerelease version pattern."
+            exit 1
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Generate tags for ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}-dev
+        id: metadata-dev
+        if: ${{ (github.event_name == 'release' && github.event.release.prerelease == true) || (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '') }}
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}-dev
+          tags: |
+            type=raw,value=${{ github.event.inputs.tag || github.ref_name }},suffix=-python${{ matrix.python-version }}${{ matrix.flavor }}
+            type=sha,suffix=-python${{ matrix.python-version }}${{ matrix.flavor }}
+          flavor: |
+            latest=false
+
+      - name: Determine latest tag
+        run: |
+          echo "LATEST_TAG=$(curl -qsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/releases/latest" \
+          | jq -r .tag_name)" >> $GITHUB_ENV
+
+      - name: Generate tags for ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+        id: metadata-prod
+        if: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_3_latest == 'true') }}
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=pep440,pattern={{version}},suffix=-python${{ matrix.python-version }}${{ matrix.flavor }},enable=${{ github.event_name == 'release' }}
+            type=pep440,pattern={{major}}.{{minor}},suffix=-python${{ matrix.python-version }}${{ matrix.flavor }},enable=${{ github.event_name == 'release' && github.event.release.prerelease == false }}
+            type=pep440,pattern={{major}},suffix=-python${{ matrix.python-version }}${{ matrix.flavor }},enable=${{ github.event_name == 'release' && github.event.release.prerelease == false && github.ref_name == env.LATEST_TAG }}
+            type=raw,value=3-latest${{ matrix.flavor }},enable=${{ (github.event_name == 'release' && github.event.release.prerelease == false && github.ref_name == env.LATEST_TAG && matrix.python-version == '3.12') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_3_latest == 'true') }}
+            type=raw,value=3-latest-python${{ matrix.python-version }}${{ matrix.flavor }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_3_latest == 'true' }}
+          flavor: |
+            latest=false
+
+      - name: Get node version
+        id: get_node_version
+        run: |
+          echo "NODE_VERSION=$(cat .nvmrc)" >> $GITHUB_OUTPUT
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ (matrix.image == 'prefect-client') && 'client/Dockerfile' || 'Dockerfile' }}
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            PYTHON_VERSION=${{ matrix.python-version }}
+            NODE_VERSION=${{ steps.get_node_version.outputs.NODE_VERSION }}
+            ${{ ( endsWith(matrix.flavor, 'conda') && 'BASE_IMAGE=prefect-conda' ) || '' }}
+            ${{ ( endsWith(matrix.flavor, 'kubernetes') && 'PREFECT_EXTRAS=[redis,kubernetes]' ) || '' }}
+          tags: ${{ join(steps.metadata-dev.outputs.tags) }},${{ join(steps.metadata-prod.outputs.tags) }}
+          labels: ${{ steps.metadata-dev.outputs.labels }}
+          push: true
+          pull: true
+          provenance: false
+          cache-from: type=gha,scope=ghcr-${{ matrix.image }}-${{ matrix.python-version }}${{ matrix.flavor }},ignore-error=true
+          cache-to: type=gha,mode=max,scope=ghcr-${{ matrix.image }}-${{ matrix.python-version }}${{ matrix.flavor }},ignore-error=true
+
+  get-prefect-aws-version:
+    name: Get latest prefect-aws version
+    runs-on: ubuntu-latest
+    outputs:
+      PREFECT_AWS_VERSION: ${{ steps.get_version.outputs.PREFECT_AWS_VERSION }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Get latest prefect-aws version from tags
+        id: get_version
+        run: |
+          PREFECT_AWS_VERSION="${{ github.event.inputs.prefect_aws_version }}"
+          if [ -z "$PREFECT_AWS_VERSION" ]; then
+            PREFECT_AWS_VERSION=$(git tag --list 'prefect-aws-*' --sort=-version:refname | head -1 | sed 's/^prefect-aws-//')
+          fi
+          echo "PREFECT_AWS_VERSION=$PREFECT_AWS_VERSION" >> $GITHUB_OUTPUT
+
+  publish-prefect-aws-ghcr:
+    name: Build and push prefect-aws to GHCR
+    needs: [publish-ghcr-images, get-prefect-aws-version]
+    if: ${{ needs.get-prefect-aws-version.outputs.PREFECT_AWS_VERSION != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+
+    steps:
+      - name: Set version environment variables
+        run: |
+          PREFECT_VERSION="${{ github.event.inputs.prefect_version }}"
+          if [ -z "$PREFECT_VERSION" ]; then
+            PREFECT_VERSION="${{ github.ref_name }}"
+          fi
+          echo "PREFECT_VERSION=$PREFECT_VERSION" >> $GITHUB_ENV
+          echo "PREFECT_AWS_VERSION=${{ needs.get-prefect-aws-version.outputs.PREFECT_AWS_VERSION }}" >> $GITHUB_ENV
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/prefect-aws
+          tags: |
+            type=raw,value=${{ env.PREFECT_AWS_VERSION }}-python${{ matrix.python-version }}-prefect${{ env.PREFECT_VERSION }}
+            type=raw,value=${{ env.PREFECT_AWS_VERSION }}-python${{ matrix.python-version }}
+            type=pep440,pattern={{major}}.{{minor}}-python${{ matrix.python-version }},value=${{ env.PREFECT_AWS_VERSION }},enable=${{ !contains(env.PREFECT_AWS_VERSION, 'rc') }}
+            type=raw,value=latest-python${{ matrix.python-version }},enable=${{ !contains(env.PREFECT_AWS_VERSION, 'rc') }}
+            type=raw,value=latest,enable=${{ matrix.python-version == '3.12' && !contains(env.PREFECT_AWS_VERSION, 'rc') }}
+          flavor: |
+            latest=false
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: src/integrations/prefect-aws
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            PYTHON_VERSION=${{ matrix.python-version }}
+            PREFECT_VERSION=${{ env.PREFECT_VERSION }}
+            PREFECT_AWS_VERSION=${{ env.PREFECT_AWS_VERSION }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: true
+          pull: true
+          provenance: false
+          cache-from: type=gha,scope=ghcr-prefect-aws-${{ matrix.python-version }},ignore-error=true
+          cache-to: type=gha,mode=max,scope=ghcr-prefect-aws-${{ matrix.python-version }},ignore-error=true
